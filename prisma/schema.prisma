@@ -1,0 +1,1268 @@
+// ============================================================================
+// SAREE BUSINESS APP — DATABASE SCHEMA
+// ============================================================================
+// Covers: users/roles, firms, parties, raw materials, production/weaver
+// workflow, finished stock, transfers, sales, purchases, payments, damage
+// register, and audit trail.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// USERS & ROLES
+// ----------------------------------------------------------------------------
+
+enum Role {
+  MASTER
+  WORKER
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  mobile       String   @unique
+  passwordHash String
+  role         Role
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Unused legacy column — Worker access is now a fixed capability set
+  // (see src/lib/permissions.ts), not per-user configurable. Left in place
+  // rather than dropped to avoid a destructive migration; safe to ignore.
+  permissions Json?
+
+  // Historical only: weavers no longer log in, but past WEAVER accounts
+  // (now disabled WORKER rows) may still carry a linked WeaverProfile.
+  weaverProfile WeaverProfile?
+
+  createdEntries    AuditLog[]     @relation("AuditActor")
+  workTicketsIssued WorkTicket[]   @relation("IssuedBy")
+  collections       Collection[]   @relation("CollectedBy")
+  purchases         Purchase[]     @relation("PurchaseCreatedBy")
+  sales             Sale[]         @relation("SaleCreatedBy")
+  payments          Payment[]      @relation("PaymentRecordedBy")
+
+  dyeingBatchesCreated  DyeingBatch[]          @relation("DyeingCreatedBy")
+  warpAssignmentsMade   WarpAssignment[]       @relation("AssignedBy")
+  materialIssuesGiven   MaterialIssue[]        @relation("MaterialIssuedBy")
+  sareeReceivingEntries SareeReceivingEntry[]  @relation("SareeReceivedBy")
+  ordersCreated         Order[]                @relation("OrderCreatedBy")
+  jariLotsAssignedBy    JariLot[]              @relation("JariLotAssignedBy")
+
+  weaverLedgerEntriesCreated WeaverLedgerEntry[] @relation("WeaverLedgerCreatedBy")
+  weaverWagesRecorded        WeaverWage[]        @relation("WeaverWageRecordedBy")
+  weftDyeingSent             WeftDyeingBatch[]   @relation("WeftDyeingSentBy")
+  weftDyeingReceived         WeftDyeingBatch[]   @relation("WeftDyeingReceivedBy")
+  weaverPaymentsRecorded     WeaverPayment[]     @relation("WeaverPaymentRecordedBy")
+  productionBatchesCreated   ProductionBatch[]   @relation("ProductionBatchCreatedBy")
+  expensesRecorded          Expense[]            @relation("ExpenseRecordedBy")
+
+  @@index([role])
+}
+
+// Weaver master data. Weavers do not log in — this is a standalone profile,
+// not an account. `userId` only remains populated on the handful of legacy
+// rows created back when weavers had their own login; it's optional and
+// unused for any new weaver going forward.
+model WeaverProfile {
+  id       String   @id @default(cuid())
+  name     String
+  mobile   String?
+  address  String?
+  notes    String? // rate details, etc.
+  isActive Boolean  @default(true)
+
+  user   User?   @relation(fields: [userId], references: [id])
+  userId String? @unique
+
+  // Default godown/factory this weaver's collected work is added to
+  assignedLocation   StockLocation @relation(fields: [assignedLocationId], references: [id])
+  assignedLocationId String
+
+  sareeTypes      WeaverSareeType[]
+  workTickets     WorkTicket[]
+  damages         DamageRegister[]
+  warpAssignments WarpAssignment[]
+  materialIssues  MaterialIssue[]
+  ledgerEntries   WeaverLedgerEntry[]
+  wages           WeaverWage[]
+  payments        WeaverPayment[]
+  productionBatches ProductionBatch[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ----------------------------------------------------------------------------
+// WEAVER FINANCIAL LEDGER (v2 gap #1/#2 — see CLAUDE.md's "v2 structural-gap
+// roadmap"). Deliberately separate from the Party/Payment system: weavers
+// are master data, not accounts (see WeaverProfile above), and this ledger
+// only needs a simple running Dr/Cr account, not GST/branches/credit-limit
+// machinery. Manual entry — not auto-derived from MaterialIssue/
+// WarpAssignment, to avoid entangling this with the live production chain.
+// ----------------------------------------------------------------------------
+
+enum WeaverLedgerEntryType {
+  MATERIAL_ISSUED
+  WAGES_EARNED
+  PAYMENT_MADE
+  ADJUSTMENT
+}
+
+// Ledger-of-events + signed-amount, mirroring RawMaterialTransaction's
+// pattern: positive = increases what the business owes the weaver (wages
+// earned, or a credit adjustment), negative = decreases it (material
+// issued and valued against them, a cash payment made, or a debit
+// adjustment). Balance = sum(amount) — positive means the weaver is owed
+// money, negative means they've been advanced more material value than
+// earned so far. WeaverWage/WeaverPayment post here via refType/refId
+// rather than duplicating amounts elsewhere.
+model WeaverLedgerEntry {
+  id       String                @id @default(cuid())
+  weaver   WeaverProfile         @relation(fields: [weaverId], references: [id])
+  weaverId String
+  type     WeaverLedgerEntryType
+  amount   Decimal               @db.Decimal(12, 2)
+  refType  String? // "WeaverWage" | "WeaverPayment" | null for manual entries
+  refId    String?
+  notes    String?
+  date     DateTime              @default(now())
+
+  createdBy   User     @relation("WeaverLedgerCreatedBy", fields: [createdById], references: [id])
+  createdById String
+  createdAt   DateTime @default(now())
+
+  @@index([weaverId])
+}
+
+// Piece-rate wages for a weaver's production — quantity x rate, posts a
+// WAGES_EARNED WeaverLedgerEntry on creation. "Paid" status isn't stored
+// here — like Purchase/Sale bills, it's computed live from linked
+// WeaverPayment rows, not a manually-flipped flag.
+model WeaverWage {
+  id          String        @id @default(cuid())
+  weaver      WeaverProfile @relation(fields: [weaverId], references: [id])
+  weaverId    String
+  sareeType   SareeType?    @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId String?
+  // The specific warp this wage pays for, when it's a full-warp wage
+  // (quantity 24 x that weaver+sareeType's ratePerSaree) rather than a
+  // manual/partial entry — lets Wages list "completed, not yet paid"
+  // warps by checking which COMPLETED WarpAssignments have no wage here.
+  warpAssignment   WarpAssignment? @relation(fields: [warpAssignmentId], references: [id])
+  warpAssignmentId String?         @unique
+  quantity    Int
+  rate        Decimal       @db.Decimal(12, 2)
+  amount      Decimal       @db.Decimal(12, 2) // quantity * rate
+  date        DateTime      @default(now())
+  notes       String?
+
+  productionBatch   ProductionBatch? @relation(fields: [productionBatchId], references: [id])
+  productionBatchId String?
+
+  recordedBy   User   @relation("WeaverWageRecordedBy", fields: [recordedById], references: [id])
+  recordedById String
+  createdAt    DateTime @default(now())
+
+  payments WeaverPayment[]
+}
+
+enum ProductionBatchStatus {
+  IN_PRODUCTION
+  COMPLETED
+}
+
+// Purai — an additive grouping layer bundling one weaver's warp assignment
+// + material issues + wages into a numbered batch (v2 gap #5 — see
+// CLAUDE.md's "v2 structural-gap roadmap"). Does NOT replace
+// WarpAssignment's own lifecycle (assign -> start -> receive ->
+// 24th-changeover, redesigned earlier this project around whole-physical-
+// warp assignment) — existing flows keep working completely unchanged,
+// entities just optionally get tagged here. "Completed" is informational
+// (a status flag + a checklist the Master can override), not a hard block
+// on the underlying WarpAssignment/MaterialIssue/WeaverWage actions,
+// matching this codebase's "don't block the physical flow" philosophy.
+model ProductionBatch {
+  id          String                @id @default(cuid())
+  weaver      WeaverProfile         @relation(fields: [weaverId], references: [id])
+  weaverId    String
+  batchNumber Int // sequential PER WEAVER (this weaver's Purai 1, 2, 3...)
+  status      ProductionBatchStatus @default(IN_PRODUCTION)
+  date        DateTime              @default(now())
+  notes       String?
+  lockedAt    DateTime?
+
+  createdBy   User   @relation("ProductionBatchCreatedBy", fields: [createdById], references: [id])
+  createdById String
+  createdAt   DateTime @default(now())
+
+  warpAssignments WarpAssignment[]
+  materialIssues  MaterialIssue[]
+  wages           WeaverWage[]
+
+  @@unique([weaverId, batchNumber])
+}
+
+// A cash payment made TO a weaver — separate from Payment (which requires
+// a Party and is wired into computePartyBalances). Optionally links to a
+// specific WeaverWage (mirrors Payment.purchaseId/saleId's optional-link
+// pattern), but doesn't have to. Posts a PAYMENT_MADE WeaverLedgerEntry.
+model WeaverPayment {
+  id       String        @id @default(cuid())
+  weaver   WeaverProfile @relation(fields: [weaverId], references: [id])
+  weaverId String
+
+  weaverWage   WeaverWage? @relation(fields: [weaverWageId], references: [id])
+  weaverWageId String?
+
+  amount    Decimal  @db.Decimal(12, 2)
+  date      DateTime @default(now())
+  method    String?
+  reference String?
+  notes     String?
+
+  recordedBy   User   @relation("WeaverPaymentRecordedBy", fields: [recordedById], references: [id])
+  recordedById String
+  createdAt    DateTime @default(now())
+}
+
+// A weaver can weave multiple saree types (e.g. Prabhu -> Bodi + Border).
+model WeaverSareeType {
+  weaver      WeaverProfile @relation(fields: [weaverId], references: [id], onDelete: Cascade)
+  weaverId    String
+  sareeType   SareeType     @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId String
+  // Wage rate for one saree of this type, woven by this weaver — set once
+  // here so Wages entry can default quantity 24 x this rate for a
+  // completed warp instead of the rate being retyped every time.
+  ratePerSaree Decimal? @db.Decimal(10, 2)
+
+  @@id([weaverId, sareeTypeId])
+}
+
+// ----------------------------------------------------------------------------
+// FIRM MASTER
+// ----------------------------------------------------------------------------
+
+model Firm {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  gstNumber   String?
+  address     String?
+  contactInfo String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  purchases Purchase[]
+  sales     Sale[]
+  expenses  Expense[]
+}
+
+// ----------------------------------------------------------------------------
+// PARTY MASTER (suppliers + customers, one central list)
+// ----------------------------------------------------------------------------
+
+enum PartyType {
+  PURCHASE
+  SALES
+  BOTH
+  // Added for v2 gap #7 — see CLAUDE.md's "v2 structural-gap roadmap".
+  // Concrete enum values rather than a generic user-editable Ledger Type
+  // master (design decision made during planning): smaller, safer, matches
+  // this codebase's existing fixed-enum convention (e.g. RawMaterialCategory).
+  TRANSPORTER
+  DYEING
+  AGENT
+  JOB_WORKER
+}
+
+model Party {
+  id            String    @id @default(cuid())
+  name          String
+  type          PartyType
+  mobile        String?
+  email         String?
+  address       String?
+  gstNumber     String?
+  openingBalance Decimal  @default(0) @db.Decimal(12, 2)
+  creditLimit   Decimal?  @db.Decimal(12, 2)
+  paymentTerms  String? // e.g. "Net 30"
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  branches      Branch[]
+  purchases     Purchase[]
+  purchaseReturns PurchaseReturn[]
+  sales         Sale[]
+  salesReturns  SalesReturn[]
+  payments      Payment[]
+  orders        Order[]
+  jariLots      JariLot[]
+  dyeingBatches DyeingBatch[]
+
+  @@index([type])
+}
+
+// A party can have multiple branches; selecting one on a Sale/Purchase
+// auto-fills its address in the form.
+model Branch {
+  id        String   @id @default(cuid())
+  party     Party    @relation(fields: [partyId], references: [id], onDelete: Cascade)
+  partyId   String
+  name      String
+  address   String?
+  phone     String?
+  createdAt DateTime @default(now())
+
+  sales     Sale[]
+  purchases Purchase[]
+
+  @@index([partyId])
+}
+
+// ----------------------------------------------------------------------------
+// SAREE TYPE MASTER
+// ----------------------------------------------------------------------------
+
+// Warp/weft/jari-per-saree consumption rates only make sense for the
+// SAREE group — non-saree groups just leave them at 0/default (no schema
+// enforcement, matching this codebase's "rule lives in the action, not
+// the schema" convention, e.g. RawMaterialCategory's Warp-is-always-Nos
+// rule). Deliberately NOT a model rename (SareeType -> generic "Item" —
+// sareeTypeId is referenced by ~10 other models and pervasively named
+// throughout the UI text; the FK is already generic in practice, only
+// the label isn't) — see CLAUDE.md's "v2 structural-gap roadmap" gap #11.
+enum ItemGroup {
+  SAREE
+  DHOTI
+  WASTE
+  OTHER
+}
+
+model SareeType {
+  id               String   @id @default(cuid())
+  name             String   @unique // Bodi, Border, Tissue, Contrast, Oosi
+  alternateNames   String[] @default([]) // e.g. Bodi -> Brocade, Brocket
+  itemGroup        ItemGroup @default(SAREE)
+  hsnCode          String? // GST HSN/SAC code, printed on Sale bills
+  jariPerSaree     Decimal  @db.Decimal(6, 3) // Jari (Nos) consumed per saree
+  weftGramsPerSaree Decimal @default(280) @db.Decimal(8, 2) // dyed Weft (g) consumed per saree
+  // Manually-maintained valuation basis for finished-saree stock (v2 gap
+  // #9 — see CLAUDE.md's "v2 structural-gap roadmap"). No automatic
+  // costing engine; the Master sets/updates this directly.
+  costPrice        Decimal? @db.Decimal(12, 2)
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+
+  weavers           WeaverSareeType[]
+  workTickets       WorkTicket[]
+  collections       Collection[]
+  finishedStockRows FinishedStockBalance[]
+  stockTransfers    StockTransfer[]         @relation("TransferSareeType")
+  saleItems         SaleItem[]
+  purchaseItems     PurchaseItem[]
+  damageEntries     DamageRegister[]
+  warpAssignments   WarpAssignment[]
+  materialIssues    MaterialIssue[]
+  orders            Order[]
+  weaverWages       WeaverWage[]
+}
+
+// ----------------------------------------------------------------------------
+// STOCK LOCATIONS (Factory/Godown 1-4, Home)
+// ----------------------------------------------------------------------------
+
+enum LocationKind {
+  GODOWN
+  HOME
+}
+
+model StockLocation {
+  id        String       @id @default(cuid())
+  name      String       @unique // "Factory / Godown 1" ... "Home / Ready-to-Sale Stock"
+  kind      LocationKind
+  address   String?
+  isActive  Boolean      @default(true)
+
+  weaverProfiles     WeaverProfile[]
+  collections        Collection[]
+  transfersFrom      StockTransfer[]         @relation("TransferFrom")
+  transfersTo        StockTransfer[]         @relation("TransferTo")
+  finishedStockRows  FinishedStockBalance[]
+  damageEntries      DamageRegister[]
+}
+
+// ----------------------------------------------------------------------------
+// RAW MATERIAL INVENTORY (shared, not firm-specific)
+// ----------------------------------------------------------------------------
+
+// WARP is always counted in Nos, never Kg — enforced in the raw material
+// create/edit action, not by the schema.
+enum RawMaterialCategory {
+  WARP
+  WEFT
+  JARI
+  DYE
+  ELECTRONICS
+  OTHER
+}
+
+model RawMaterial {
+  id            String              @id @default(cuid())
+  name          String              @unique // Silk Warp, Weft, Jari, ...
+  category      RawMaterialCategory @default(OTHER)
+  hsnCode       String?             // GST HSN/SAC code, printed on Purchase bills
+  unit          String              // free text, e.g. "Nos", "Kg", "Litre" — configurable per material
+  currentStock  Decimal             @default(0) @db.Decimal(12, 3)
+  lowStockLevel Decimal?            @db.Decimal(12, 3)
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  purchaseItems       PurchaseItem[]
+  purchaseReturnItems PurchaseReturnItem[]
+  workTicketMaterials WorkTicketMaterial[]
+  transactions        RawMaterialTransaction[]
+  warpBatches          WarpBatch[]
+  dyeingBatches        DyeingBatch[]
+  jariLotsAssigned     JariLot[]
+}
+
+// Ledger of every raw-material stock movement, for audit/traceability.
+enum RawMaterialTxnType {
+  PURCHASE_IN
+  ISSUE_OUT
+  RETURN_IN
+  ADJUSTMENT
+}
+
+model RawMaterialTransaction {
+  id            String              @id @default(cuid())
+  rawMaterial   RawMaterial         @relation(fields: [rawMaterialId], references: [id])
+  rawMaterialId String
+  type          RawMaterialTxnType
+  quantity      Decimal             @db.Decimal(12, 3) // positive = in, negative = out
+  refType       String? // "Purchase" | "WorkTicket" | "PurchaseReturn" | "Adjustment"
+  refId         String?
+  notes         String?
+  createdAt     DateTime            @default(now())
+}
+
+// A warp batch: one warp can produce 24 sarees. Tracks how many "saree
+// units" of material have already been issued against it so remaining
+// capacity can be shown when issuing work to a weaver.
+model WarpBatch {
+  id            String   @id @default(cuid())
+  reference     String   @unique // batch code / reference
+  rawMaterial   RawMaterial @relation(fields: [rawMaterialId], references: [id])
+  rawMaterialId String
+  totalCapacity Int      @default(24) // sarees producible from this warp
+  issuedCount   Int      @default(0) // sarees' worth of material already issued
+  createdAt     DateTime @default(now())
+
+  workTickets WorkTicket[]
+
+  @@index([reference])
+}
+
+// ----------------------------------------------------------------------------
+// PRODUCTION / WEAVER WORKFLOW
+// ----------------------------------------------------------------------------
+
+enum WorkTicketStatus {
+  ISSUED         // Issued by Master
+  IN_WEAVING     // In Weaving
+  FINISHED       // Weaver marked Finished
+  READY_FOR_COLLECTION
+  COLLECTED
+}
+
+model WorkTicket {
+  id            String           @id @default(cuid())
+  weaver        WeaverProfile    @relation(fields: [weaverId], references: [id])
+  weaverId      String
+  warpBatch     WarpBatch        @relation(fields: [warpBatchId], references: [id])
+  warpBatchId   String
+  sareeType     SareeType        @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId   String
+
+  issuedSareeCount Int           // usually 3, sometimes 1 when material is low
+  completedSareeCount Int        @default(0) // sarees the weaver has reported done so far, out of issuedSareeCount
+  expectedCompletionDate DateTime?
+  notes         String?
+  status        WorkTicketStatus @default(ISSUED)
+
+  issuedBy      User             @relation("IssuedBy", fields: [issuedById], references: [id])
+  issuedById    String
+  issuedAt      DateTime         @default(now())
+  finishedAt    DateTime?
+
+  materials   WorkTicketMaterial[]
+  collections Collection[]
+  damageEntries DamageRegister[]
+
+  @@index([status])
+  @@index([weaverId])
+}
+
+// Line items of materials issued for a work ticket (warp, weft, jari, other)
+model WorkTicketMaterial {
+  id            String      @id @default(cuid())
+  workTicket    WorkTicket  @relation(fields: [workTicketId], references: [id], onDelete: Cascade)
+  workTicketId  String
+  rawMaterial   RawMaterial @relation(fields: [rawMaterialId], references: [id])
+  rawMaterialId String
+  quantity      Decimal     @db.Decimal(12, 3)
+}
+
+// Master collecting finished saree(s) from a weaver's work ticket into
+// that weaver's assigned godown/factory.
+model Collection {
+  id           String        @id @default(cuid())
+  workTicket   WorkTicket    @relation(fields: [workTicketId], references: [id])
+  workTicketId String
+  sareeType    SareeType     @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId  String
+  quantity     Int
+  location     StockLocation @relation(fields: [locationId], references: [id]) // weaver's assigned godown
+  locationId   String
+  collectedBy  User          @relation("CollectedBy", fields: [collectedById], references: [id])
+  collectedById String
+  collectedAt  DateTime      @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// WARP DYEING & ASSIGNMENT
+// ----------------------------------------------------------------------------
+// Replaces WarpBatch/WorkTicket/Collection for all NEW production — those
+// models above are kept as-is for historical data only (2 real WarpBatch +
+// 2 WorkTicket + 1 Collection rows predate this), no longer used by the
+// active UI. See CLAUDE.md's "Spec expansion project" section for why.
+
+enum DyeingBatchStatus {
+  SENT
+  PARTIALLY_RECEIVED
+  RECEIVED
+}
+
+enum WeftDyeingStatus {
+  SENT
+  RECEIVED
+}
+
+// A much simpler cousin of DyeingBatch (warp dyeing) — weft yarn dyeing has
+// no per-warp shade breakdown or saree-type linkage, just plain yarn sent
+// by colour+weight and the same weight (roughly) coming back dyed. On
+// receive, the weight goes straight into that colour's WEFT RawMaterial
+// stock (find-or-create by name) since that's what Material Issue draws
+// from — see recordWeaverWage's comment style: this is the "produces
+// something the rest of the app already understands" side effect.
+model WeftDyeingBatch {
+  id                 String           @id @default(cuid())
+  colourName         String
+  sentWeightKg       Decimal          @db.Decimal(8, 2)
+  sentDate           DateTime         @default(now())
+  receivedWeightKg   Decimal?         @db.Decimal(8, 2)
+  receivedDate       DateTime?
+  status             WeftDyeingStatus @default(SENT)
+  sentBy             User             @relation("WeftDyeingSentBy", fields: [sentById], references: [id])
+  sentById           String
+  receivedBy         User?            @relation("WeftDyeingReceivedBy", fields: [receivedById], references: [id])
+  receivedById       String?
+  createdAt          DateTime         @default(now())
+}
+
+model DyeingBatch {
+  id            String            @id @default(cuid())
+  reference     String            @unique // DYE-000001
+  rawMaterial   RawMaterial       @relation(fields: [rawMaterialId], references: [id])
+  rawMaterialId String
+  warpCount     Int // number of raw warps sent
+  sentDate      DateTime          @default(now())
+  status        DyeingBatchStatus @default(SENT)
+  remarks       String?
+
+  // Dyeing billing (v2 gap #6 — see CLAUDE.md's "v2 structural-gap
+  // roadmap"). All optional — the physical send/receive flow (above)
+  // works exactly as before with none of these set; a party only needs
+  // picking when the business wants to track and pay for this dyeing job.
+  party              Party?    @relation(fields: [partyId], references: [id])
+  partyId            String?
+  charges            Decimal?  @db.Decimal(12, 2)
+  expectedReturnDate DateTime?
+
+  createdBy   User   @relation("DyeingCreatedBy", fields: [createdById], references: [id])
+  createdById String
+  createdAt   DateTime @default(now())
+
+  warps    DyeingBatchWarp[]
+  payments Payment[]
+
+  @@index([status])
+}
+
+// One row per physical warp within the batch — shade distribution is
+// per-warp, not per-batch.
+model DyeingBatchWarp {
+  id              String      @id @default(cuid())
+  dyeingBatch     DyeingBatch @relation(fields: [dyeingBatchId], references: [id], onDelete: Cascade)
+  dyeingBatchId   String
+  warpIndex       Int // 1, 2, 3... within the batch
+  receivedAt      DateTime?
+  receivedRemarks String?
+
+  shadeLines     DyeingShadeLine[]
+  warpAssignment WarpAssignment?
+
+  @@unique([dyeingBatchId, warpIndex])
+}
+
+// Shade breakdown for one warp; sentQuantity must sum to 24 per warp
+// (validated in the action, not the schema — Postgres has no CHECK-across-rows).
+model DyeingShadeLine {
+  id                String          @id @default(cuid())
+  dyeingBatchWarp   DyeingBatchWarp @relation(fields: [dyeingBatchWarpId], references: [id], onDelete: Cascade)
+  dyeingBatchWarpId String
+  shadeNumber       String // free text — physical shade book, not a dropdown
+  sentQuantity      Int
+  receivedQuantity  Int? // filled at receive time; no loss % invented, actual counts only
+  // Position of this colour along the warp (1, 2, 3...), set when the warp
+  // is assigned to a weaver — see assignWarp's shadeOrder param. Defaults
+  // to creation order (0 for every line) until arranged; Material Issue
+  // sorts by this so Jari/Weft can be matched to the actual colour sequence.
+  order             Int             @default(0)
+}
+
+enum WarpAssignmentStatus {
+  ASSIGNED
+  WAITING_TO_START
+  STARTED
+  COMPLETED
+}
+
+// One weaver's one current (or upcoming) warp, from assignment through the
+// 24th-saree changeover. See src/lib/actions/warpAssignments.ts for the
+// full lifecycle.
+model WarpAssignment {
+  id          String        @id @default(cuid())
+  weaver      WeaverProfile @relation(fields: [weaverId], references: [id])
+  weaverId    String
+  sareeType   SareeType     @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId String
+
+  // The one physical warp (already received from dyeing) this assignment
+  // hands over in full — a warp is always given to a weaver whole, never
+  // split across weavers. Nullable only for historical rows created before
+  // this link existed (a free-text shade breakdown was assignable without
+  // referencing a specific physical warp back then).
+  dyeingBatchWarp   DyeingBatchWarp? @relation(fields: [dyeingBatchWarpId], references: [id])
+  dyeingBatchWarpId String?          @unique
+
+  // Optional Purai (production batch) grouping — purely additive tagging,
+  // doesn't change this model's own lifecycle at all (see ProductionBatch).
+  productionBatch   ProductionBatch? @relation(fields: [productionBatchId], references: [id])
+  productionBatchId String?
+
+  status         WarpAssignmentStatus @default(ASSIGNED)
+  assignmentDate DateTime  @default(now()) // NOT the warp start date
+  warpStartDate  DateTime? // actual date the weaver starts weaving this warp
+
+  // 24th-saree changeover tracking (spec section 9)
+  twentyFourthWovenAt DateTime? // done on the machine, held there
+  completedAt         DateTime? // 24th actually cut & received -> warp fully done
+
+  remarks String?
+
+  // The weaver's warp this one supersedes, if any — makes changeover
+  // duration trivially computable (warpStartDate - previous.twentyFourthWovenAt)
+  previousAssignment   WarpAssignment? @relation("WarpChangeover", fields: [previousAssignmentId], references: [id])
+  previousAssignmentId String?         @unique
+  nextAssignment       WarpAssignment? @relation("WarpChangeover")
+
+  assignedBy   User   @relation("AssignedBy", fields: [assignedById], references: [id])
+  assignedById String
+  createdAt    DateTime @default(now())
+
+  shadeLines       WarpAssignmentShadeLine[]
+  receivingEntries SareeReceivingEntry[]
+  materialIssues   MaterialIssue[]
+  wage             WeaverWage?
+
+  @@index([weaverId, status])
+}
+
+// Legacy shade breakdown for assignments made before dyeingBatchWarpId
+// existed (free-text shades, not tied to a specific physical warp). No
+// longer written to by assignWarp — kept only so old WarpAssignment rows
+// keep their historical shade data. New assignments read shade composition
+// straight off dyeingBatchWarp.shadeLines instead.
+model WarpAssignmentShadeLine {
+  id               String         @id @default(cuid())
+  warpAssignment   WarpAssignment @relation(fields: [warpAssignmentId], references: [id], onDelete: Cascade)
+  warpAssignmentId String
+  shadeNumber      String
+  quantity         Int
+}
+
+// One row per saree physically received off a specific warp assignment.
+// Sarees 1-23 increment FinishedStockBalance immediately on creation; the
+// 24th is only ever created by the changeover action (cutAndReceiveTwentyFourth
+// in warpAssignments.ts) — never automatically, per spec section 9.
+enum SareeUnitStatus {
+  IN_STOCK
+  SOLD
+  DAMAGED
+}
+
+model SareeReceivingEntry {
+  id               String         @id @default(cuid())
+  warpAssignment   WarpAssignment @relation(fields: [warpAssignmentId], references: [id])
+  warpAssignmentId String
+  sareeNumber      Int // 1-24
+  receivedAt       DateTime @default(now())
+  receivedBy       User     @relation("SareeReceivedBy", fields: [receivedById], references: [id])
+  receivedById     String
+
+  // Per-saree identity (v2 gap #3 — see CLAUDE.md's "v2 structural-gap
+  // roadmap"). This row already is "one saree, one record," so identity
+  // fields live here rather than a separate SareeUnit model. serialNumber
+  // is always generated at receive time; the rest are best-effort
+  // snapshots (weight/design entered later, warp/weft/jari colour
+  // denormalized from the production chain at receive time) — editable
+  // after the fact since the source data can be approximate. status is
+  // informational only for now — nothing outside this model sets it away
+  // from IN_STOCK yet (Sale/Damage still transact by aggregate quantity,
+  // not by picking specific serials).
+  serialNumber String          @unique
+  weightGram   Decimal?        @db.Decimal(8, 2)
+  designName   String?
+  warpColour   String?
+  weftColour   String?
+  jariColour   String?
+  photoUrls    String[]        @default([])
+  status       SareeUnitStatus @default(IN_STOCK)
+
+  // Optional short-code masters (v2 gap #10 — see CLAUDE.md's "v2
+  // structural-gap roadmap"), alongside the existing free-text
+  // warpColour/weftColour/jariColour fields above — not a replacement for
+  // them, an additional structured pick when the business wants one.
+  sareeColour   SareeColourMaster? @relation(fields: [sareeColourId], references: [id])
+  sareeColourId String?
+  jariCode      JariCodeMaster?    @relation(fields: [jariCodeId], references: [id])
+  jariCodeId    String?
+
+  damageEntries DamageRegister[]
+
+  @@unique([warpAssignmentId, sareeNumber])
+}
+
+// Independent code+name master for a saree's own displayed colour,
+// distinct from its warp/weft/jari material colour (e.g. "M101" = Green).
+model SareeColourMaster {
+  id       String   @id @default(cuid())
+  code     String   @unique
+  name     String
+  isActive Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  sareeReceivingEntries SareeReceivingEntry[]
+}
+
+// Short combo-code master for a Jari brand mix recorded per saree at
+// receiving time (e.g. "C/S" = Copper/Silver) — distinct from the Jari
+// brand RawMaterial rows used for stock/issuing (see CLAUDE.md's "Jari
+// brands & Weft colours").
+model JariCodeMaster {
+  id       String   @id @default(cuid())
+  code     String   @unique
+  name     String
+  isActive Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  sareeReceivingEntries SareeReceivingEntry[]
+}
+
+// Weft + Jari issued to a weaver based on saree count (1-6); quantities are
+// system-calculated from SareeType.jariPerSaree / weftGramsPerSaree, never
+// typed in by hand.
+model MaterialIssue {
+  id          String    @id @default(cuid())
+  weaver      WeaverProfile @relation(fields: [weaverId], references: [id])
+  weaverId    String
+  sareeType   SareeType @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId String
+
+  warpAssignment   WarpAssignment? @relation(fields: [warpAssignmentId], references: [id])
+  warpAssignmentId String?
+
+  productionBatch   ProductionBatch? @relation(fields: [productionBatchId], references: [id])
+  productionBatchId String?
+
+  sareeCount      Int // 1-6 — sarees this Jari issue covers
+  jariIssued      Decimal @db.Decimal(6, 3) // Nos, = jariPerSaree * sareeCount
+  // Weft doesn't always need reissuing for every saree in the same batch
+  // (e.g. issuing Jari for 6 sarees but only 3 of them actually need new
+  // Weft) — weftSareeCount defaults to sareeCount but can be set lower.
+  weftSareeCount  Int     @default(0)
+  weftIssuedGrams Decimal @db.Decimal(8, 2) // grams, = weftGramsPerSaree * weftSareeCount
+
+  date    DateTime @default(now())
+  remarks String?
+
+  issuedBy   User   @relation("MaterialIssuedBy", fields: [issuedById], references: [id])
+  issuedById String
+  createdAt  DateTime @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// FINISHED SAREE STOCK
+// ----------------------------------------------------------------------------
+
+enum StockState {
+  NORMAL
+  DAMAGED
+  SENT_FOR_REPAIR
+  UNDER_REPAIR
+  REPAIRED
+}
+
+// Materialized balance table: one row per (location, sareeType, state).
+// Kept in sync by application logic inside DB transactions whenever a
+// collection, transfer, sale, return, or damage event occurs.
+model FinishedStockBalance {
+  id          String        @id @default(cuid())
+  location    StockLocation @relation(fields: [locationId], references: [id])
+  locationId  String
+  sareeType   SareeType     @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId String
+  state       StockState    @default(NORMAL)
+  quantity    Int           @default(0)
+  updatedAt   DateTime      @updatedAt
+
+  @@unique([locationId, sareeTypeId, state])
+}
+
+// Godown -> Home stock transfers (only allowed direction)
+model StockTransfer {
+  id             String        @id @default(cuid())
+  fromLocation   StockLocation @relation("TransferFrom", fields: [fromLocationId], references: [id])
+  fromLocationId String
+  toLocation     StockLocation @relation("TransferTo", fields: [toLocationId], references: [id])
+  toLocationId   String
+  sareeType      SareeType     @relation(fields: [sareeTypeId], references: [id], name: "TransferSareeType")
+  sareeTypeId    String
+  quantity       Int
+  notes          String?
+  transferredAt  DateTime      @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// PURCHASES
+// ----------------------------------------------------------------------------
+
+enum PurchaseType {
+  WITH_INVOICE
+  WITHOUT_INVOICE
+}
+
+model Purchase {
+  id             String       @id @default(cuid())
+  purchaseNumber String       @unique // internal auto number, PUR-000001 style
+  purchaseType   PurchaseType @default(WITH_INVOICE)
+  invoiceNumber  String?      @unique // blank for small/no-bill local suppliers (WITHOUT_INVOICE)
+  firm           Firm         @relation(fields: [firmId], references: [id])
+  firmId         String
+  party          Party        @relation(fields: [partyId], references: [id])
+  partyId        String
+  branch         Branch?      @relation(fields: [branchId], references: [id])
+  branchId       String?
+  date           DateTime     @default(now())
+  gstAmount      Decimal      @default(0) @db.Decimal(12, 2)
+  totalAmount    Decimal      @db.Decimal(12, 2)
+  lrNumber       String?
+  ewayBillNumber String?
+  notes          String?
+  // A historical/backdated bill entered for record-keeping and party-ledger
+  // accuracy only (mirrors Sale.isOpeningEntry) — bulkImportPurchases sets
+  // this to true so raw-material stock and RawMaterialTransaction rows are
+  // never touched for imported history.
+  isOpeningEntry Boolean      @default(false)
+
+  createdBy   User   @relation("PurchaseCreatedBy", fields: [createdById], references: [id])
+  createdById String
+  createdAt   DateTime @default(now())
+
+  items   PurchaseItem[]
+  returns PurchaseReturn[]
+  payments Payment[]
+  jariLots JariLot[]
+}
+
+model PurchaseItem {
+  id            String      @id @default(cuid())
+  purchase      Purchase    @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  purchaseId    String
+  // Exactly one of rawMaterial/sareeType is set. Normal Purchase Entry
+  // (raw materials for production) always sets rawMaterial. sareeType is
+  // only used by bulkImportPurchases for bills that were actually buying
+  // finished sarees for resale rather than production inputs — those never
+  // affect RawMaterial.currentStock, and since bulk-imported purchases are
+  // also isOpeningEntry, they don't touch FinishedStockBalance either;
+  // they exist purely for the party/GST/accounting record.
+  rawMaterial   RawMaterial? @relation(fields: [rawMaterialId], references: [id])
+  rawMaterialId String?
+  sareeType     SareeType?  @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId   String?
+  quantity      Decimal     @db.Decimal(12, 3)
+  rate          Decimal     @db.Decimal(12, 2)
+  amount        Decimal     @db.Decimal(12, 2)
+
+  jariLot JariLot?
+}
+
+// A box/lot of Jari received via Purchase whose brand isn't known yet — the
+// business mixes different Jari brands, and often can't tell which brand a
+// physical box is until it's opened and checked. createPurchase() does NOT
+// increment RawMaterial.currentStock for JARI-category line items; instead
+// it creates one of these (status UNASSIGNED). The Master reviews unopened
+// boxes on /jari-lots and clicks "Assign brand" to name it — only then does
+// assignJariBrand() (src/lib/actions/jariLots.ts) move the quantity into a
+// real named-brand RawMaterial's stock.
+enum JariLotStatus {
+  UNASSIGNED
+  ASSIGNED
+}
+
+model JariLot {
+  id                 String        @id @default(cuid())
+  purchase           Purchase      @relation(fields: [purchaseId], references: [id])
+  purchaseId         String
+  purchaseItem       PurchaseItem  @relation(fields: [purchaseItemId], references: [id])
+  purchaseItemId     String        @unique
+  party              Party         @relation(fields: [partyId], references: [id])
+  partyId            String
+  sourceMaterialName String // raw material name entered on the purchase line, for display only
+  quantity           Decimal       @db.Decimal(12, 3)
+  unit               String
+  receivedDate       DateTime      @default(now())
+  status             JariLotStatus @default(UNASSIGNED)
+
+  assignedMaterial   RawMaterial? @relation(fields: [assignedMaterialId], references: [id])
+  assignedMaterialId String?
+  assignedAt         DateTime?
+  assignedBy         User?        @relation("JariLotAssignedBy", fields: [assignedById], references: [id])
+  assignedById       String?
+
+  createdAt DateTime @default(now())
+
+  @@index([status])
+}
+
+model PurchaseReturn {
+  id          String   @id @default(cuid())
+  purchase    Purchase @relation(fields: [purchaseId], references: [id])
+  purchaseId  String
+  party       Party    @relation(fields: [partyId], references: [id])
+  partyId     String
+  date        DateTime @default(now())
+  amount      Decimal  @db.Decimal(12, 2)
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  items PurchaseReturnItem[]
+}
+
+// Line items of raw material actually returned — required, so every
+// return reliably decrements RawMaterial.currentStock (see createPurchaseReturn).
+model PurchaseReturnItem {
+  id               String         @id @default(cuid())
+  purchaseReturn   PurchaseReturn @relation(fields: [purchaseReturnId], references: [id], onDelete: Cascade)
+  purchaseReturnId String
+  rawMaterial      RawMaterial    @relation(fields: [rawMaterialId], references: [id])
+  rawMaterialId    String
+  quantity         Decimal        @db.Decimal(12, 3)
+}
+
+// ----------------------------------------------------------------------------
+// SALES
+// ----------------------------------------------------------------------------
+
+enum FreightStatus {
+  PAID
+  TO_PAY
+}
+
+model Sale {
+  id             String        @id @default(cuid())
+  saleNumber     String        @unique // internal auto number, SAL-000001 style
+  invoiceNumber  String        @unique
+  firm           Firm          @relation(fields: [firmId], references: [id])
+  firmId         String
+  party          Party         @relation(fields: [partyId], references: [id])
+  partyId        String
+  branch         Branch?       @relation(fields: [branchId], references: [id])
+  branchId       String?
+  date           DateTime      @default(now())
+  gstAmount      Decimal       @default(0) @db.Decimal(12, 2)
+  totalAmount    Decimal       @db.Decimal(12, 2)
+  dueDate        DateTime?
+  ewayBillNumber String?
+  courierLrNumber String? // Courier/LR Number
+  courierCharges Decimal?      @db.Decimal(12, 2)
+  freightStatus  FreightStatus?
+  notes          String?
+  // A historical/backdated bill entered for record-keeping and party-ledger
+  // accuracy only — createSale skips the stock-sufficiency check and the
+  // FinishedStockBalance decrement entirely when this is true.
+  isOpeningEntry Boolean       @default(false)
+
+  createdBy   User   @relation("SaleCreatedBy", fields: [createdById], references: [id])
+  createdById String
+  createdAt   DateTime @default(now())
+
+  items   SaleItem[]
+  returns SalesReturn[]
+  payments Payment[]
+}
+
+model SaleItem {
+  id          String    @id @default(cuid())
+  sale        Sale      @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  saleId      String
+  sareeType   SareeType @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId String
+  quantity    Int
+  rate        Decimal   @db.Decimal(12, 2)
+  amount      Decimal   @db.Decimal(12, 2)
+
+  returnItems SalesReturnItem[]
+}
+
+enum SalesReturnCondition {
+  GOOD
+  DAMAGED
+}
+
+model SalesReturn {
+  id        String   @id @default(cuid())
+  sale      Sale     @relation(fields: [saleId], references: [id])
+  saleId    String
+  party     Party    @relation(fields: [partyId], references: [id])
+  partyId   String
+  date      DateTime @default(now())
+  amount    Decimal  @db.Decimal(12, 2)
+  reason    String?
+  createdAt DateTime @default(now())
+
+  items SalesReturnItem[]
+}
+
+// Required line items — quantity is validated against what's actually left
+// on the original SaleItem (sold minus already-returned), and condition
+// decides where the saree goes: GOOD back to FinishedStockBalance NORMAL
+// stock at the chosen location, DAMAGED into the Damage register instead
+// (spec section 14).
+model SalesReturnItem {
+  id            String                @id @default(cuid())
+  salesReturn   SalesReturn           @relation(fields: [salesReturnId], references: [id], onDelete: Cascade)
+  salesReturnId String
+  saleItem      SaleItem              @relation(fields: [saleItemId], references: [id])
+  saleItemId    String
+  quantity      Int
+  condition     SalesReturnCondition
+}
+
+// ----------------------------------------------------------------------------
+// PAYMENTS
+// ----------------------------------------------------------------------------
+
+enum PaymentDirection {
+  PAID     // we paid a supplier
+  RECEIVED // we received from a customer
+}
+
+model Payment {
+  id          String           @id @default(cuid())
+  party       Party            @relation(fields: [partyId], references: [id])
+  partyId     String
+  direction   PaymentDirection
+  amount      Decimal          @db.Decimal(12, 2)
+  date        DateTime         @default(now())
+  method      String? // cash, bank transfer, UPI, cheque...
+  reference   String?
+  notes       String?
+
+  purchase   Purchase? @relation(fields: [purchaseId], references: [id])
+  purchaseId String?
+  sale       Sale?     @relation(fields: [saleId], references: [id])
+  saleId     String?
+  dyeingBatch   DyeingBatch? @relation(fields: [dyeingBatchId], references: [id])
+  dyeingBatchId String?
+
+  recordedBy   User   @relation("PaymentRecordedBy", fields: [recordedById], references: [id])
+  recordedById String
+  createdAt    DateTime @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// DAMAGE & REPAIR REGISTER
+// ----------------------------------------------------------------------------
+
+enum DamageType {
+  WEAVING_DEFECT
+  COLOUR_ISSUE
+  JARI_ISSUE
+  BORDER_ISSUE
+  TEAR_CUT
+  STAIN
+  OTHER
+}
+
+enum DamageStatus {
+  DAMAGED
+  SENT_FOR_REPAIR
+  UNDER_REPAIR
+  REPAIRED
+  NON_REPAIRABLE
+  BACK_TO_NORMAL_STOCK
+}
+
+model DamageRegister {
+  id           String        @id @default(cuid())
+  damageNumber String        @unique // unique individual number, damaged sarees only
+
+  weaver       WeaverProfile? @relation(fields: [weaverId], references: [id])
+  weaverId     String?
+  workTicket   WorkTicket?    @relation(fields: [workTicketId], references: [id])
+  workTicketId String?
+
+  // The exact physical saree, when reported from Saree Book (status ->
+  // Damaged there opens this form pre-linked) — lets the Damage Register
+  // show the serial number instead of just an aggregate saree-type count.
+  // Nullable: damage can still be logged in aggregate (no specific serial
+  // picked) the same way it always could.
+  sareeReceivingEntry   SareeReceivingEntry? @relation(fields: [sareeReceivingEntryId], references: [id])
+  sareeReceivingEntryId String?
+
+  sareeType    SareeType     @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId  String
+
+  damageDate   DateTime      @default(now())
+  damageType   DamageType
+  description  String?
+  photoUrls    String[]      @default([])
+
+  location     StockLocation @relation(fields: [locationId], references: [id])
+  locationId   String
+
+  repairable     Boolean?
+  repairer       String?
+  repairAmount   Decimal?  @db.Decimal(12, 2)
+  sentOutDate    DateTime?
+  repairedDate   DateTime?
+
+  status DamageStatus @default(DAMAGED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+// ----------------------------------------------------------------------------
+// ORDERS
+// ----------------------------------------------------------------------------
+// A customer order taken before production starts — separate from Sale
+// (which is the actual delivered/billed transaction). status is a manual
+// checklist the Master advances by hand; it is NOT derived from any
+// DyeingBatch/WarpAssignment/SareeReceivingEntry, since one warp's 24
+// sarees go into general stock rather than being earmarked for a specific
+// order.
+
+enum OrderStatus {
+  ORDER_PLACED
+  WARP_DYEING
+  WEAVING
+  READY
+  DELIVERED
+  CANCELLED
+}
+
+model Order {
+  id          String    @id @default(cuid())
+  orderNumber String    @unique // internal auto number, ORD-000001 style
+  party       Party     @relation(fields: [partyId], references: [id])
+  partyId     String
+  sareeType   SareeType @relation(fields: [sareeTypeId], references: [id])
+  sareeTypeId String
+  quantity    Int
+  rate        Decimal   @db.Decimal(12, 2) // price per saree
+  totalAmount Decimal   @db.Decimal(12, 2) // quantity * rate, computed at create time
+
+  warpColour String?
+  weftColour String?
+  jariColour String?
+  description String?
+  dueDate    DateTime?
+  notes      String?
+
+  status OrderStatus @default(ORDER_PLACED)
+
+  createdBy   User   @relation("OrderCreatedBy", fields: [createdById], references: [id])
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+}
+
+// ----------------------------------------------------------------------------
+// EXPENSES (v2 gap #8 — see CLAUDE.md's "v2 structural-gap roadmap")
+// ----------------------------------------------------------------------------
+// Feeds the simplified P&L on /reports (Sales - Purchases - Wages -
+// Expenses = Net Margin, cash-basis — not full accrual/COGS costing).
+
+enum ExpenseCategory {
+  MANUFACTURING
+  OTHER
+}
+
+model Expense {
+  id       String          @id @default(cuid())
+  date     DateTime        @default(now())
+  category ExpenseCategory
+  amount   Decimal         @db.Decimal(12, 2)
+  notes    String?
+  firm     Firm?           @relation(fields: [firmId], references: [id])
+  firmId   String?
+
+  recordedBy   User   @relation("ExpenseRecordedBy", fields: [recordedById], references: [id])
+  recordedById String
+  createdAt    DateTime @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// AUDIT TRAIL
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actor      User     @relation("AuditActor", fields: [actorId], references: [id])
+  actorId    String
+  action     String // "CREATE" | "UPDATE" | "DELETE" | "RETURN" | "TRANSFER" | ...
+  entityType String // "Purchase" | "Sale" | "StockTransfer" | ...
+  entityId   String
+  before     Json?
+  after      Json?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+}

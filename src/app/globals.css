@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-display: 'Fraunces', serif;
+  --font-body: 'Inter', sans-serif;
+}
+
+body {
+  @apply bg-brand-50 text-ink;
+}
+
+/* Below md, Sidebar renders a fixed top bar + fixed bottom tab bar instead of
+   the desktop side rail — pad body so neither one covers page content. Kept
+   here rather than per-page so none of the ~16 pages that render <Sidebar />
+   need editing. */
+@media (max-width: 767px) {
+  body {
+    padding-top: 4rem;
+    padding-bottom: calc(4rem + env(safe-area-inset-bottom));
+  }
+}
